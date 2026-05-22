@@ -1,0 +1,241 @@
+---
+title: "PredictionModels"
+output: html_document
+---
+
+```{r setup, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(glmnet)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(pROC)
+```
+
+```{r load-data}
+master_df <- read_csv("master_data.csv")
+```
+
+```{r preprocess}
+model_df <- master_df %>%
+  mutate(
+    injured_next_week = as.integer(injured_next_week),
+    surface_type      = as.integer(factor(surface_type)),
+    temp_bucket       = as.integer(factor(temp_bucket)),
+    position_group    = as.integer(factor(position_group)),
+    is_home           = as.integer(is_home)
+  )
+
+model_df <- model_df %>%
+  select(
+    injured_next_week,
+    years_exp, surface_type, temp_bucket, total_plays,
+    avg_air_yards, bmi, rush_plays, age, position_group,
+    is_home, avg_ydline_100
+  ) %>%
+  mutate(across(everything(), ~ ifelse(is.na(.), median(., na.rm = TRUE), .)))
+```
+
+
+```{r split}
+set.seed(42)
+train_idx <- createDataPartition(model_df$injured_next_week, p = 0.8, list = FALSE)
+train_df  <- model_df[train_idx, ]
+test_df   <- model_df[-train_idx, ]
+
+X_train <- as.matrix(train_df %>% select(-injured_next_week))
+y_train <- train_df$injured_next_week
+X_test  <- as.matrix(test_df %>% select(-injured_next_week))
+y_test  <- test_df$injured_next_week
+
+injury_rate <- mean(y_train)
+weights     <- ifelse(y_train == 1, (1 - injury_rate) / injury_rate, 1)
+```
+
+# Lasso Regression
+```{r lasso, fig.width=8, fig.height=5}
+set.seed(42)
+cv_lasso <- cv.glmnet(
+  x = X_train, y = y_train, alpha = 1,
+  nfolds = 10, family = "gaussian", weights = weights
+)
+final_lasso <- glmnet(
+  x = X_train, y = y_train, alpha = 1,
+  lambda = cv_lasso$lambda.min, family = "gaussian", weights = weights
+)
+
+# Coefficients
+coef_df <- data.frame(
+  feature     = rownames(coef(final_lasso)),
+  coefficient = as.numeric(coef(final_lasso))
+) %>%
+  filter(coefficient != 0, feature != "(Intercept)") %>%
+  arrange(desc(abs(coefficient)))
+
+ggplot(coef_df, aes(x = reorder(feature, coefficient), y = coefficient, fill = coefficient > 0)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  labs(title = "Lasso -- Non-Zero Coefficients", x = "Feature", y = "Coefficient") +
+  theme_minimal()
+
+# Evaluate
+lasso_preds_raw <- as.numeric(predict(final_lasso, newx = X_test, s = cv_lasso$lambda.min))
+lasso_preds_bin <- as.integer(lasso_preds_raw >= 0.5)
+
+cat("--- Lasso ---\n")
+cat("RMSE:    ", round(sqrt(mean((lasso_preds_raw - y_test)^2)), 4), "\n")
+cat("MAE:     ", round(mean(abs(lasso_preds_raw - y_test)), 4), "\n")
+cat("Accuracy:", round(mean(lasso_preds_bin == y_test), 4), "\n")
+print(table(Predicted = lasso_preds_bin, Actual = y_test))
+
+roc_lasso <- roc(y_test, lasso_preds_raw, quiet = TRUE)
+plot(roc_lasso, main = paste("Lasso ROC | AUC =", round(auc(roc_lasso), 3)))
+```
+
+# Random Forest
+```{r random-forest, fig.width=8, fig.height=5}
+set.seed(42)
+rf_model <- randomForest(
+  x        = X_train,
+  y        = factor(y_train),
+  ntree    = 500,
+  mtry     = floor(sqrt(ncol(X_train))),
+  classwt  = c("0" = 1, "1" = (1 - injury_rate) / injury_rate),
+  importance = TRUE
+)
+
+# Feature importance
+importance_df <- data.frame(
+  feature    = rownames(importance(rf_model)),
+  importance = importance(rf_model)[, "MeanDecreaseGini"]
+) %>% arrange(desc(importance))
+
+ggplot(importance_df, aes(x = reorder(feature, importance), y = importance)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Random Forest -- Feature Importance", x = "Feature", y = "Mean Decrease Gini") +
+  theme_minimal()
+tuneRF(X_train, factor(y_train), stepFactor = 1.5, improve = 0.01)
+
+# Evaluate
+rf_preds_raw <- predict(rf_model, newdata = X_test, type = "prob")[, "1"]
+rf_preds_bin <- as.integer(rf_preds_raw >= 0.5)
+
+cat("--- Random Forest ---\n")
+cat("RMSE:    ", round(sqrt(mean((rf_preds_raw - y_test)^2)), 4), "\n")
+cat("MAE:     ", round(mean(abs(rf_preds_raw - y_test)), 4), "\n")
+cat("Accuracy:", round(mean(rf_preds_bin == y_test), 4), "\n")
+print(table(Predicted = rf_preds_bin, Actual = y_test))
+
+roc_rf <- roc(y_test, rf_preds_raw, quiet = TRUE)
+plot(roc_rf, main = paste("Random Forest ROC | AUC =", round(auc(roc_rf), 3)))
+```
+
+# XGBoost
+```{r xgboost, fig.width=8, fig.height=5}
+scale_pos <- sum(y_train == 0) / sum(y_train == 1)
+
+dtrain <- xgb.DMatrix(data = X_train, label = y_train)
+dtest  <- xgb.DMatrix(data = X_test,  label = y_test)
+
+set.seed(42)
+xgb_model <- xgb.train(
+  params = list(
+    objective        = "binary:logistic",
+    eval_metric      = "auc",
+    eta              = 0.05,
+    max_depth        = 4,
+    subsample        = 0.8,
+    colsample_bytree = 0.8,
+    scale_pos_weight = scale_pos
+  ),
+  data    = dtrain,
+  nrounds = 200,
+  watchlist  = list(train = dtrain, test = dtest),
+  verbose    = 0
+)
+
+# Feature importance
+xgb_imp <- xgb.importance(model = xgb_model)
+xgb.plot.importance(xgb_imp, main = "XGBoost -- Feature Importance")
+
+# Evaluate
+xgb_preds_raw <- predict(xgb_model, dtest)
+xgb_preds_bin <- as.integer(xgb_preds_raw >= 0.5)
+
+cat("--- XGBoost ---\n")
+cat("RMSE:    ", round(sqrt(mean((xgb_preds_raw - y_test)^2)), 4), "\n")
+cat("MAE:     ", round(mean(abs(xgb_preds_raw - y_test)), 4), "\n")
+cat("Accuracy:", round(mean(xgb_preds_bin == y_test), 4), "\n")
+print(table(Predicted = xgb_preds_bin, Actual = y_test))
+
+roc_xgb <- roc(y_test, xgb_preds_raw, quiet = TRUE)
+plot(roc_xgb, main = paste("XGBoost ROC | AUC =", round(auc(roc_xgb), 3)))
+```
+
+# Model Comparison
+```{r compare}
+comparison <- data.frame(
+  Model    = c("Lasso", "Random Forest", "XGBoost"),
+  Accuracy = c(mean(lasso_preds_bin == y_test),
+               mean(rf_preds_bin == y_test),
+               mean(xgb_preds_bin == y_test)),
+  AUC      = c(auc(roc_lasso), auc(roc_rf), auc(roc_xgb)),
+  RMSE     = c(sqrt(mean((lasso_preds_raw - y_test)^2)),
+               sqrt(mean((rf_preds_raw - y_test)^2)),
+               sqrt(mean((xgb_preds_raw - y_test)^2)))
+) %>% mutate(across(where(is.numeric), ~ round(., 4)))
+
+print(comparison)
+```
+
+```{r final-model}
+injury_rate <- mean(y_train)
+weights <- ifelse(y_train == 1, (1 - injury_rate) / injury_rate, 1)
+
+cv_lasso <- cv.glmnet(
+  x       = X_train,
+  y       = y_train,
+  alpha   = 1,
+  nfolds  = 10,
+  family  = "gaussian",
+  weights = weights
+)
+# Non-zero coefficients
+coef_df <- data.frame(
+  feature     = rownames(coef(final_lasso)),
+  coefficient = as.numeric(coef(final_lasso))
+) %>%
+  filter(coefficient != 0, feature != "(Intercept)") %>%
+  arrange(desc(abs(coefficient)))
+
+print(coef_df)
+```
+
+```{r coef-plot, fig.width=8, fig.height=5}
+ggplot(coef_df, aes(x = reorder(feature, coefficient), y = coefficient, fill = coefficient > 0)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_manual(values = c("steelblue", "tomato")) +
+  labs(title = "Lasso -- Non-Zero Coefficients", x = "Feature", y = "Coefficient") +
+  theme_minimal()
+```
+```{r evaluate}
+preds        <- as.numeric(predict(final_lasso, newx = X_test, s = cv_lasso$lambda.min))
+preds_binary <- as.integer(pmin(pmax(preds, 0), 1) >= 0.5)
+
+cat("RMSE:    ", round(sqrt(mean((preds - y_test)^2)), 4), "\n")
+cat("MAE:     ", round(mean(abs(preds - y_test)), 4), "\n")
+cat("Accuracy:", round(mean(preds_binary == y_test), 4), "\n")
+
+table(Predicted = preds_binary, Actual = y_test)
+
+
+
+
+saveRDS(xgb_model,   "xgb_model.rds")
+saveRDS(rf_model,    "rf_model.rds")
+saveRDS(final_lasso, "lasso_model.rds")
+saveRDS(cv_lasso,    "cv_lasso.rds")  # needed for lasso lambda
+```

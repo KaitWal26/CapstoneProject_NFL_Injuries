@@ -1,0 +1,288 @@
+---
+title: "DataPrep"
+author: "Kaitlynn Walston"
+output: pdf_document
+---
+
+```{r}
+# Load required packages for accessing NFL data to perform data cleaning and manipulation
+library(nflreadr)
+library(nflfastR)
+library(tidyverse)
+```
+
+```{r}
+# Import 2024 season datasets for play-by-play, player statistics, injuries, rosters, and schedules
+# This time frame will later be expanded for modeling but just using 2024 data for informative plots at the moment
+pbp_data <- load_pbp(2010:2024)
+stats <- load_player_stats(2010:2024)
+injuries_raw  <- load_injuries(2010:2024)
+rosters_raw   <- load_rosters(2010:2024)
+schedules_raw <- load_schedules(2010:2024)
+```
+
+```{r}
+injuries <- injuries_raw %>%
+  #Remove rows with missing player IDs or invalid week entry
+  filter(!is.na(gsis_id), !is.na(week), week >= 1) %>%
+  mutate(
+    #Combine injury description fields into single variable
+    injury_text = coalesce(report_primary_injury, practice_primary_injury, "Unknown"),
+    injury_category = case_when(
+      # Categorize unstructured injury text into standardized anatomical groups
+      str_detect(injury_text, regex("concussion|head", ignore_case = TRUE)) ~ "Head/Concussion",
+      str_detect(injury_text, regex("shoulder|rotator", ignore_case = TRUE)) ~ "Shoulder",
+      str_detect(injury_text, regex("knee|acl|mcl|meniscus", ignore_case = TRUE)) ~ "Knee",
+      str_detect(injury_text, regex("ankle|foot|toe", ignore_case = TRUE)) ~ "Ankle/Foot",
+      str_detect(injury_text, regex("hamstring|quad|thigh", ignore_case = TRUE)) ~ "Thigh/Hamstring",
+      str_detect(injury_text, regex("back|spine|lumbar", ignore_case = TRUE)) ~ "Back/Spine",
+      str_detect(injury_text, regex("hip|groin", ignore_case = TRUE)) ~ "Hip/Core",
+      str_detect(injury_text, regex("elbow|wrist|hand|finger", ignore_case = TRUE)) ~ "Arm/Hand",
+      str_detect(injury_text, regex("chest|rib", ignore_case = TRUE)) ~ "Chest/Ribs",
+      str_detect(injury_text, regex("calf|achilles|shin", ignore_case = TRUE)) ~ "Lower Leg",
+      str_detect(injury_text, regex("neck|cervical", ignore_case = TRUE)) ~ "Neck",
+      str_detect(injury_text, regex("illness|flu|covid", ignore_case = TRUE)) ~ "Illness",
+      TRUE ~ "Other"
+    ),
+    # Create a binary concussion indicator from injury text and standardize report_status into severity categories
+    is_concussion = str_detect(injury_text, regex("concussion", ignore_case = TRUE)),
+    severity = case_when(
+      report_status %in% c("Out", "IR", "PUP") ~ "Out",
+      report_status == "Doubtful" ~ "Doubtful",
+      report_status == "Questionable" ~ "Questionable",
+      report_status == "Probable" ~ "Probable",
+      TRUE ~ "Unknown"
+    ),
+    # Consolidate individual player positions into broader functional groups for modeling
+    position_group = case_when(
+      position == "QB" ~ "QB",
+      position %in% c("RB", "FB") ~ "RB",
+      position %in% c("WR", "TE") ~ "Receiver",
+      position %in% c("OT", "OG", "C", "G", "T", "OL") ~ "O-Line",
+      position %in% c("DT", "DE", "NT", "DL" , "ED") ~ "D-Line",
+      position %in% c("LB", "OLB", "ILB", "MLB") ~ "LB",
+      position %in% c("CB", "S", "DB", "FS", "SS", "SAF") ~ "Secondary",
+      position %in% c("K", "P", "KR", "PR", "LS") ~ "Special Teams",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  # Select key identifiers and derived injury features for modeling
+  select(season, week, team, gsis_id, full_name, position,
+         position_group, injury_category, is_concussion, severity)
+```
+
+```{r}
+# Keep valid in game plays with meaningful data
+injury_pbp <- pbp_data %>%
+  filter(
+    !is.na(yardline_100),
+    play_type %in% c("run", "pass", "punt", "kickoff"),
+    quarter_seconds_remaining > 0
+  ) %>% select(season, week, game_id, posteam, defteam, yardline_100, 
+               game_seconds_remaining, play_type, play_id, rusher_player_id, 
+               receiver_player_id, passer_player_id
+  )
+# Convert player role columns into long format to generate player-level participation records
+injury_exposure_long <- injury_pbp %>%
+  pivot_longer(
+    cols = c(rusher_player_id, receiver_player_id, passer_player_id),
+    names_to = "role",
+    values_to = "gsis_id"
+  ) %>% filter(!is.na(gsis_id)) %>%
+  mutate(role=recode(role, 
+                     rusher_player_id = "Rusher",
+                     receiver_player_id = "Receiver",
+                     passer_player_id = "Passer"))
+```
+
+```{r}
+# Summarize play-level data into weekly player-level features for injury risk modeling
+field_postition_expo <- injury_exposure_long %>%
+  group_by(season, week, gsis_id) %>%
+  summarise(
+    avg_ydline_100 = mean(yardline_100, na.rm=TRUE),
+    min_ydline_100 = min(yardline_100, na.rm=TRUE),
+    max_ydline_100 = max(yardline_100, na.rm=TRUE),
+    avg_game_sec_remaining = mean(game_seconds_remaining, na.rm=TRUE),
+    total_expo_plays = n(),
+    .groups = "drop"
+) %>%
+  mutate(
+    field_zone = case_when(
+      avg_ydline_100 <= 20  ~ "Backed Up",
+      avg_ydline_100 <= 40  ~ "Own Territory",
+      avg_ydline_100 <= 60  ~ "Midfield",
+      avg_ydline_100 <= 80  ~ "Opponent Territory",
+      avg_ydline_100 <= 100 ~ "Red Zone",
+      TRUE ~ "Unknown"
+    )
+  )
+```
+
+```{r}
+rosters <- rosters_raw %>%
+  # Remove rows without player ID, position, or team
+  filter(!is.na(gsis_id), !is.na(position), !is.na(team)) %>%
+  mutate(
+    # Calculate age starting at September 1st in years
+    age = as.numeric(
+      difftime(as.Date(paste0(season, "-09-01")), as.Date(birth_date), units = "days")
+    ) / 365.25,
+    # Compute BMI
+    bmi = round((weight / height^2) * 703, 1),
+    # Consolidate individual player positions into broader functional groups matching previous grouping
+    position_group = case_when(
+      position == "QB" ~ "QB",
+      position %in% c("RB", "FB") ~ "RB",
+      position %in% c("WR", "TE") ~ "Receiver",
+      position %in% c("OT", "OG", "C", "G", "T", "OL") ~ "O-Line",
+      position %in% c("DT", "DE", "NT", "DL" , "ED") ~ "D-Line",
+      position %in% c("LB", "OLB", "ILB", "MLB") ~ "LB",
+      position %in% c("CB", "S", "DB", "FS", "SS", "SAF") ~ "Secondary",
+      position %in% c("K", "P", "KR", "PR", "LS") ~ "Special Teams",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  # Select only rows needed for analysis
+  select(season, gsis_id, full_name, position, position_group,
+         age, height_in = height, weight_lb = weight, bmi, years_exp, team) %>%
+  # In case of duplicates, keep one row per player
+  distinct(season, gsis_id, .keep_all = TRUE)
+```
+
+```{r}
+schedules <- schedules_raw %>%
+  select(season, week, game_type, home_team, away_team,
+         any_of(c("surface", "roof", "temp", "wind"))) %>%
+  # Convert from wide to long format so each row represents one team per game
+  pivot_longer(c(home_team, away_team), names_to = "side", values_to = "team") %>%
+  mutate(
+    is_home = side == "home_team",
+    # Standardize playing surface into categories
+    surface_type = case_when(
+      str_detect(surface, regex("grass", ignore_case = TRUE)) ~ "Natural Grass",
+      is.na(surface) ~ "Unknown",
+      TRUE           ~ "Artificial Turf"
+    ),
+    # Categorize temperature into into discrete ranges for analysis
+    temp_bucket = case_when(
+      is.na(temp)  ~ "Dome/Unknown",
+      temp < 32    ~ "Freezing",
+      temp < 50    ~ "Cold",
+      temp < 65    ~ "Cool",
+      temp < 80    ~ "Moderate",
+      TRUE         ~ "Hot"
+    )
+  ) %>%
+  # Select only relevant and engineered schedule features
+  select(season, week, team, game_type, is_home, surface_type,
+         temp_bucket, temp_f = any_of("temp"))
+```
+
+```{r}
+# Filter official passing plays with a valid quarterback and create workload indicators
+passers <- pbp_data %>%
+  filter(!is.na(passer_player_id), play_type == "pass") %>%
+  transmute(season, week, gsis_id = passer_player_id, team = posteam,
+            is_pass = 1L, is_run = 0L,
+            was_hit = as.integer(qb_hit == 1),
+            air_yards = as.numeric(air_yards))
+# Filter official rushing plays with a valid ball carrier and create rushing workload indicators
+rushers <- pbp_data %>%
+  filter(!is.na(rusher_player_id), play_type == "run") %>%
+  transmute(season, week, gsis_id = rusher_player_id, team = posteam,
+            is_pass = 0L, is_run = 1L,
+            was_hit = 0L, air_yards = NA_real_)
+# Filter official passing plays with a valid receiver and create receiving workload indicators
+receivers <- pbp_data %>%
+  filter(!is.na(receiver_player_id), play_type == "pass") %>%
+  transmute(season, week, gsis_id = receiver_player_id, team = posteam,
+            is_pass = 1L, is_run = 0L,
+            was_hit = 0L, air_yards = as.numeric(air_yards))
+# Combine quarterback, rusher, and receiver workloads and summarize to player-week level
+workload <- bind_rows(passers, rushers, receivers) %>%
+  group_by(season, week, gsis_id, team) %>%
+  summarise(
+    total_plays   = n(),
+    pass_plays    = sum(is_pass),
+    rush_plays    = sum(is_run),
+    times_hit     = sum(was_hit, na.rm = TRUE),
+    avg_air_yards = mean(air_yards, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  # Replace players with no air yard values with NA
+  mutate(avg_air_yards = ifelse(is.nan(avg_air_yards), NA, avg_air_yards))
+```
+
+```{r}
+# Create binary indicator for whether a player is injured the following week
+injury_flag <- injuries %>%
+  filter(severity %in% c("Out", "Doubtful", "Questionable")) %>%
+  transmute(
+    season,
+    week        = week - 1,
+    gsis_id,
+    injured_next_week = TRUE
+  ) %>%
+  distinct(season, week, gsis_id, .keep_all = TRUE)
+```
+
+```{r}
+# Create team-week data with one row per team per game
+team_weeks <- schedules_raw %>%
+  select(season, week, home_team, away_team) %>%
+  pivot_longer(c(home_team, away_team), names_to = "side", values_to = "team") %>%
+  select(season, week, team) %>%
+  distinct()
+# Expand to full regular season player-week data
+all_player_weeks <- rosters %>%
+  inner_join(team_weeks, by = c("season", "team")) %>%
+  filter(week >= 1, week <= 18)
+```
+
+```{r}
+# Merge workload, schedule, injury, and exposure features into a final play-week dataset
+master_df <- all_player_weeks %>%
+  left_join(workload, by = c("season", "week", "gsis_id", "team")) %>%
+  left_join(schedules, by = c("season", "week", "team")) %>%
+  left_join(injury_flag, by = c("season", "week", "gsis_id")) %>%
+  left_join(field_postition_expo, by = c("season", "week", "gsis_id")) %>%
+  # Handle missing values and create defaults for modeling
+  mutate(
+    injured_next_week = replace_na(injured_next_week, FALSE),
+    full_name = replace_na(full_name,"Unknown"),
+    position = replace_na(position,"Unknown"),
+    position_group = replace_na(position_group,"Unknown"),
+    surface_type = replace_na(surface_type,"Unknown"),
+    temp_bucket = replace_na(temp_bucket,"Unknown"),
+    age = replace_na(age, 25.0),
+    bmi = replace_na(bmi, 27.0),
+    years_exp         = replace_na(years_exp,2L),
+    total_plays = replace_na(total_plays, 0L),
+    pass_plays = replace_na(pass_plays, 0L),
+    rush_plays = replace_na(rush_plays,0L),
+    times_hit = replace_na(times_hit,0L),
+    total_expo_plays = replace_na(total_expo_plays, 0L),
+  ) %>%
+  # Filter to regular season weeks and select features needed for analysis
+  filter(week >= 1, week <= 18) %>%
+  select(
+    season, week, game_type,
+    gsis_id, full_name, team,
+    position, position_group,
+    age, height_in, weight_lb, bmi, years_exp,
+    total_plays, pass_plays, rush_plays, times_hit, avg_air_yards,
+    is_home, surface_type, temp_bucket, any_of("temp_f"),
+    avg_ydline_100,
+    min_ydline_100,
+    max_ydline_100,
+    avg_game_sec_remaining,
+    total_expo_plays,
+    field_zone,
+    injured_next_week
+  ) %>%
+  arrange(season, week, team, full_name)
+# Export the fully processed player-week dataset for modeling and visualization
+write_csv(master_df, "master_data.csv")
+
+```
