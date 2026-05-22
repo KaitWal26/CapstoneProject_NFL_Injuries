@@ -1,0 +1,913 @@
+---
+title: "ShinyModel"
+output: html_document
+---
+
+```{r}
+#install.packages('shinydashboard')
+library(shiny)
+library(shinydashboard)
+library(tidyverse)
+#install.packages("janitor")
+library(janitor)
+library(xgboost)
+library(plotly)
+library(DT)
+
+nfl_data <- read.csv("master_data.csv") %>%
+  janitor::clean_names() %>%
+  mutate(
+    temperature       = if ("temp_f" %in% names(.)) as.numeric(temp_f) else NA_real_,
+    injured_next_week = as.numeric(as.logical(injured_next_week)),
+    surface_type      = as.character(surface_type),
+    game_id           = paste(season, week, game_type, sep = "_")
+  ) %>%
+  filter(
+    !is.na(surface_type),
+    !is.na(team)
+  )
+```
+
+```{r}
+# ─── UI ────────────────────────────────────────────────────────────────────────
+ui <- dashboardPage(
+  skin = "black",
+  dashboardHeader(
+    title = span(
+      img(src = "https://upload.wikimedia.org/wikipedia/en/a/a2/National_Football_League_logo.svg",
+          height = "30px", style = "margin-right: 8px;"),
+      "NFL Injury Risk Dashboard"
+    ),
+    titleWidth = 300
+  ),
+
+  dashboardSidebar(
+    width = 300,
+    sidebarMenu(
+      id = "tabs",
+      menuItem("Overview",                  tabName = "overview",    icon = icon("chart-line")),
+      menuItem("Injury Risk Predictor",     tabName = "predictor",   icon = icon("user-injured")),
+      menuItem("Position Analysis",         tabName = "position",    icon = icon("running")),
+      menuItem("Game & Environment",        tabName = "environment", icon = icon("cloud-sun")),
+      menuItem("Workload & Snap Count",     tabName = "workload",    icon = icon("stopwatch")),
+      menuItem("Individual Team Dashboard", tabName = "team",        icon = icon("shield-alt")),
+      menuItem("Rule Changes Impact",       tabName = "rules",       icon = icon("gavel")),
+      menuItem("Injury Field Map",          tabName = "fieldmap",    icon = icon("football-ball"))
+    ),
+    hr(),
+    tags$div(
+      style = "padding: 0 15px;",
+      tags$h4("Global Filters", style = "color: #b8c7ce; font-size: 13px;"),
+      sliderInput("season_range", "Seasons:", min = 2010, max = 2024, value = c(2010, 2024), sep = ""),
+      selectInput("game_type", "Game Type:", choices = c("All", "REG", "POST"), selected = "All")
+    )
+  ),
+
+  dashboardBody(
+    tags$head(tags$style(HTML("
+      .content-wrapper, .right-side { background-color: #1a1a2e; }
+      .box { border-top: 3px solid #c9243f; background-color: #16213e; color: #e0e0e0; border-radius: 8px; }
+      .info-box { background-color: #16213e !important; color: #ffffff !important; border-radius: 8px; }
+      h3.page-title { color: #ffffff; font-size: 24px; font-weight: bold; margin-bottom: 25px; }
+      .table { color: #e0e0e0; }
+      .week-display {
+        font-size: 28px; font-weight: bold; color: #c9243f;
+        text-align: center; padding: 10px; background-color: #0d0d1a;
+        border-radius: 8px; margin-bottom: 10px; letter-spacing: 2px;
+      }
+      .injury-counter { font-size: 16px; color: #b8c7ce; text-align: center; margin-bottom: 15px; }
+      .play-btn  { background-color: #c9243f !important; color: white !important; border: none !important; border-radius: 6px !important; font-size: 16px !important; width: 100% !important; margin-bottom: 8px !important; }
+      .reset-btn { background-color: #2a3a5a !important; color: white !important; border: none !important; border-radius: 6px !important; width: 100% !important; margin-bottom: 8px !important; }
+    "))),
+
+    tabItems(
+
+      # --- Tab: Overview ---
+      tabItem(tabName = "overview",
+        h3("League-Wide Injury Trends", class = "page-title"),
+        fluidRow(
+          infoBoxOutput("total_injuries_box",  width = 3),
+          infoBoxOutput("avg_per_season_box",  width = 3),
+          infoBoxOutput("injury_rate_box",     width = 3),
+          infoBoxOutput("injury_cost_box",     width = 3)
+        ),
+        fluidRow(box(title = "Weekly Injury Trend",       width = 12, plotOutput("injury_season_trend"))),
+        fluidRow(
+          box(title = "Injury Rate by Position", width = 6, plotOutput("overview_position_plot")),
+          box(title = "Workload vs Injury Risk",  width = 6, plotOutput("overview_workload_plot"))
+        ),
+        fluidRow(
+          box(title = "About this Dashboard", width = 12,
+              p("This dashboard analyzes injury across the NFL using player workload, environment, and positional data."),
+              tags$ul(
+                tags$li("Use filters to explore trends"),
+                tags$li("Compare injury rates across positions and conditions"),
+                tags$li("Use the predictor tab to estimate injury risk")
+              ))
+        )
+      ),
+
+      # --- Tab: Predictor ---
+      tabItem(tabName = "predictor",
+        h3("Injury Risk Predictor", class = "page-title"),
+        fluidRow(
+          box(title = "Player Inputs", width = 4, status = "danger",
+              selectInput("pred_model",    "Select Model:",      choices = c("XGBoost", "Random Forest", "Lasso")),
+              sliderInput("pred_age",      "Age:",               min = 21, max = 40, value = 26),
+              sliderInput("pred_bmi",      "BMI:",               min = 20, max = 40, value = 27),
+              sliderInput("pred_exp",      "Years Experience:",  min = 0,  max = 20, value = 3),
+              sliderInput("pred_plays",    "Total Plays:",       min = 0,  max = 80, value = 20),
+              selectInput("pred_position", "Position Group:",
+                          choices = c("QB", "RB", "Receiver", "O-Line", "D-Line", "LB", "Secondary", "Special Teams")),
+              selectInput("pred_surface",  "Surface Type:",
+                          choices = c("Natural Grass", "Artificial Turf", "Unknown")),
+              actionButton("predict_btn",  "Predict Injury Risk",
+                           style = "background-color:#c9243f; color:white; width:100%;")),
+          box(title = "Predicted Injury Risk", width = 8, status = "danger",
+              h3(textOutput("pred_probability"),
+                 style = "text-align:center; font-size:64px; color:#c9243f; margin-top:40px;"),
+              h4(textOutput("pred_label"),
+                 style = "text-align:center; color:#e0e0e0; font-size:20px;"),
+              hr(),
+              p("Prediction based on XGBoost, Random Forest, or Lasso models trained on 2024 NFL data.",
+                style = "color:#b8c7ce; font-size:12px;"))
+        ),
+        fluidRow(
+          box(title = "Body Part Injury Distribution", width = 6, status = "danger",
+              plotOutput("body_part_pie", height = "380px"),
+              p("Estimated injury likelihood by body region based on position group.",
+                style = "color:#b8c7ce; font-size:11px; text-align:center;")),
+          box(title = "Highest Risk Play Types", width = 6, status = "danger",
+              plotOutput("risk_plays_plot", height = "380px"),
+              p("Play types historically associated with injuries for this position.",
+                style = "color:#b8c7ce; font-size:11px; text-align:center;"))
+        ),
+        fluidRow(
+          box(title = "Risk Factor Breakdown", width = 6, status = "danger",
+              plotOutput("risk_factor_plot", height = "320px"),
+              p("How each input contributes to the predicted injury probability.",
+                style = "color:#b8c7ce; font-size:11px; text-align:center;")),
+          box(title = "Player Risk Profile", width = 6, status = "danger",
+              uiOutput("risk_profile_text"))
+        )
+      ),
+
+      # --- Tab: Position Analysis ---
+      tabItem(tabName = "position",
+        h3("Position Analysis", class = "page-title"),
+        fluidRow(
+          box(width = 4, status = "danger",
+              checkboxGroupInput("position_choice", "Select Positions:",
+                                 choices  = sort(unique(nfl_data$position_group)),
+                                 selected = sort(unique(nfl_data$position_group)))),
+          box(title = "Injury Rate by Position", width = 8, plotOutput("position_rate_plot"))
+        )
+      ),
+
+      # --- Tab: Environment ---
+      tabItem(tabName = "environment",
+        h3("Game & Environmental Factors", class = "page-title"),
+        fluidRow(
+          box(title = "Surface Filter", width = 4, status = "danger", solidHeader = TRUE,
+              checkboxGroupInput("surface_choice", "Select Surface:",
+                                 choices  = unique(nfl_data$surface_type),
+                                 selected = unique(nfl_data$surface_type))),
+          box(title = "Temp Filter", width = 8, status = "danger", solidHeader = TRUE,
+              sliderInput("temp_slider", "Temperature Range (F):",
+                          min   = min(nfl_data$temperature, na.rm = TRUE),
+                          max   = max(nfl_data$temperature, na.rm = TRUE),
+                          value = c(20, 90)))
+        ),
+        fluidRow(
+          box(title = "Injury Rate by Surface",        width = 6, plotOutput("surface_comparison")),
+          box(title = "Injury Trend by Temperature",   width = 6, plotOutput("temp_plot"))
+        )
+      ),
+
+      # --- Tab: Workload ---
+      tabItem(tabName = "workload",
+        h3("Workload & Snap Count", class = "page-title"),
+        fluidRow(
+          box(width = 4, status = "danger", solidHeader = TRUE, title = "Controls",
+              sliderInput("play_limit", "Focus Play Count Range:", min = 0, max = 100, value = c(0, 80)),
+              p("Analysis shows risk increases significantly after 60+ snaps.",
+                style = "font-size: 12px; color: #b8c7ce;")),
+          box(width = 8, title = "Probability Curve", plotOutput("workload_plot"))
+        )
+      ),
+
+      # --- Tab: Team Dashboard ---
+      tabItem(tabName = "team",
+        h3("Individual Team Dashboard", class = "page-title"),
+        fluidRow(
+          box(width = 4, status = "danger", solidHeader = TRUE, title = "Team Selector",
+              selectInput("team_select", "Select Team:",
+                          choices = sort(unique(nfl_data$team))),
+              selectInput("position_filter", "Filter by Position:",
+                          choices  = c("All", sort(unique(nfl_data$position_group))),
+                          selected = "All")),
+          infoBoxOutput("team_injuries_box", width = 8)
+        ),
+        fluidRow(box(title = "High Risk Exposure Roster", width = 12, tableOutput("team_table")))
+      ),
+
+      # --- Tab: Rules ---
+      tabItem(tabName = "rules",
+        h3("Rule Changes & Injury Risk Factors", class = "page-title"),
+        fluidRow(
+          box(title = "Hits vs Injury Risk",     width = 6, plotOutput("rules_hits_plot")),
+          box(title = "Workload vs Injury Risk", width = 6, plotOutput("rules_workload_plot"))
+        ),
+        fluidRow(
+          box(title = "Concussion Rate", width = 6, plotOutput("rules_concussion_plot")),
+          box(title = "Interpretation",  width = 6,
+              p("NFL rule changes aim to reduce high-impact collisions and player workload."),
+              p("These plots show how hits, workload, and concussion-related injuries relate to overall injury risk."),
+              p("Higher exposure to hits and plays is associated with increased injury probability."))
+        )
+      ),
+
+      # --- Tab: Injury Field Map ---
+      tabItem(tabName = "fieldmap",
+        h3("Injury Field Map", class = "page-title"),
+        fluidRow(
+          box(width = 3, status = "danger", solidHeader = TRUE, title = "Controls",
+              fluidRow(
+                column(6, actionButton("play_btn",  label = tagList(icon("play"), " Play"),  class = "play-btn")),
+                column(6, actionButton("reset_btn", label = tagList(icon("undo"), " Reset"), class = "reset-btn"))
+              ),
+              br(),
+              uiOutput("week_slider_ui"),
+              selectInput("anim_speed", "Playback Speed:",
+                          choices  = c("Slow (2s)" = 2000, "Normal (1s)" = 1000, "Fast (0.5s)" = 500),
+                          selected = 1000),
+              hr(),
+              selectInput("field_position", "Position Group:",
+                          choices  = c("All", sort(unique(nfl_data$position_group))),
+                          selected = "All"),
+              selectInput("field_surface", "Surface Type:",
+                          choices  = c("All", sort(unique(nfl_data$surface_type))),
+                          selected = "All"),
+              checkboxInput("field_cumulative", "Cumulative (all weeks up to current)", value = FALSE),
+              checkboxInput("field_density",    "Show Density Overlay",                value = TRUE),
+              p("Each dot = one injury. Press Play to animate week by week, or drag the slider manually.",
+                style = "color:#b8c7ce; font-size:11px; margin-top:10px;")
+          ),
+          box(width = 9, status = "danger", solidHeader = TRUE, title = "Injury Locations on Field",
+              uiOutput("week_badge"),
+              plotOutput("field_map", height = "460px"))
+        ),
+        fluidRow(
+          box(width = 12, title = "Injury Log - Current Week", status = "danger", solidHeader = TRUE,
+              DT::dataTableOutput("injury_log"))
+        )
+      )
+
+    ) # end tabItems
+  ) # end dashboardBody
+) # end dashboardPage
+
+
+# ─── SERVER ────────────────────────────────────────────────────────────────────
+server <- function(input, output, session) {
+
+  # ── THEME ───────────────────────────────────────────────────────────────────
+  theme_nfl_custom <- function() {
+    theme_minimal() +
+      theme(
+        text             = element_text(color = "white"),
+        panel.grid.major = element_line(color = "#2a3a5a"),
+        panel.grid.minor = element_blank(),
+        plot.background  = element_rect(fill = "#16213e", color = NA),
+        panel.background = element_rect(fill = "#16213e", color = NA),
+        axis.text        = element_text(color = "#b8c7ce"),
+        plot.title       = element_text(face = "bold", size = 14)
+      )
+  }
+
+  # ── BASE DATA ────────────────────────────────────────────────────────────────
+  base_data <- reactive({
+    nfl_data %>%
+      filter(season >= input$season_range[1], season <= input$season_range[2]) %>%
+      { if (input$game_type != "All") filter(., game_type == input$game_type) else . }
+  })
+
+  # ── DYNAMIC WEEK SLIDER ──────────────────────────────────────────────────────
+  max_reg_week <- reactive({
+    if (input$season_range[2] >= 2021) 18L else 17L
+  })
+
+  output$week_slider_ui <- renderUI({
+    sliderInput("week_slider", "Week:",
+                min = 1, max = max_reg_week(), value = 1, step = 1)
+  })
+
+  observeEvent(max_reg_week(), {
+    cur <- anim_week()
+    if (cur > max_reg_week()) anim_week(max_reg_week())
+  })
+
+  # ── ANIMATION STATE ──────────────────────────────────────────────────────────
+  playing   <- reactiveVal(FALSE)
+  anim_week <- reactiveVal(1)
+
+  observeEvent(input$week_slider, {
+    anim_week(input$week_slider)
+  }, ignoreInit = TRUE)
+
+  observeEvent(input$play_btn, {
+    if (playing()) {
+      playing(FALSE)
+      updateActionButton(session, "play_btn", label = tagList(icon("play"), " Play"))
+    } else {
+      if (anim_week() >= max_reg_week()) anim_week(1)
+      playing(TRUE)
+      updateActionButton(session, "play_btn", label = tagList(icon("pause"), " Pause"))
+    }
+  })
+
+  observeEvent(input$reset_btn, {
+    playing(FALSE)
+    updateActionButton(session, "play_btn", label = tagList(icon("play"), " Play"))
+    anim_week(1)
+    updateSliderInput(session, "week_slider", value = 1)
+  })
+
+  observe({
+    req(playing())
+    invalidateLater(as.numeric(input$anim_speed), session)
+    isolate({
+      nxt <- anim_week() + 1
+      if (nxt > max_reg_week()) {
+        playing(FALSE)
+        updateActionButton(session, "play_btn", label = tagList(icon("play"), " Play"))
+      } else {
+        anim_week(nxt)
+        updateSliderInput(session, "week_slider", value = nxt)
+      }
+    })
+  })
+
+  # ── FIELD MAP DATA ───────────────────────────────────────────────────────────
+  field_data <- reactive({
+    df <- base_data() %>% filter(!is.na(avg_ydline_100), injured_next_week == 1)
+    if (input$field_position != "All") df <- df %>% filter(position_group == input$field_position)
+    if (input$field_surface  != "All") df <- df %>% filter(surface_type   == input$field_surface)
+    df
+  })
+
+  current_week_data <- reactive({
+    df <- field_data()
+    if (isTRUE(input$field_cumulative)) df %>% filter(week <= anim_week())
+    else df %>% filter(week == anim_week())
+  })
+
+  # ── WEEK BADGE ───────────────────────────────────────────────────────────────
+  output$week_badge <- renderUI({
+    wk    <- anim_week()
+    cnt   <- nrow(current_week_data())
+    label <- paste0("Regular Season - Week ", wk)
+    tagList(
+      tags$div(class = "week-display", label),
+      tags$div(class = "injury-counter",
+               paste0(cnt, " injur", ifelse(cnt == 1, "y", "ies"),
+                      if (isTRUE(input$field_cumulative)) " (cumulative)" else " this week"))
+    )
+  })
+
+  # ── FIELD MAP PLOT ───────────────────────────────────────────────────────────
+  output$field_map <- renderPlot({
+    df  <- current_week_data()
+    all <- field_data()
+    set.seed(123)
+
+    place <- function(d) d %>% mutate(field_x = avg_ydline_100, field_y = runif(n(), 8, 52))
+    df  <- place(df)
+    all <- place(all)
+
+    p <- ggplot() +
+      annotate("rect", xmin = 0,  xmax = 100, ymin = 0, ymax = 60, fill = "#2d5a1b") +
+      annotate("rect", xmin = 0,  xmax = 10,  ymin = 0, ymax = 60, fill = "#1a3d0f") +
+      annotate("rect", xmin = 90, xmax = 100, ymin = 0, ymax = 60, fill = "#1a3d0f") +
+      annotate("rect", xmin = c(10, 30, 50, 70, 90), xmax = c(20, 40, 60, 80, 100),
+               ymin = 0, ymax = 60, fill = "#336b22", alpha = 0.45) +
+      geom_vline(xintercept = seq(10, 90, 10), color = "white", linewidth = 0.6, alpha = 0.8) +
+      geom_vline(xintercept = seq(15, 85, 10), color = "white", linewidth = 0.2, alpha = 0.35) +
+      geom_vline(xintercept = 50,              color = "white", linewidth = 1.2) +
+      annotate("rect", xmin = 0, xmax = 100, ymin = 0, ymax = 60,
+               fill = NA, color = "white", linewidth = 1) +
+      annotate("text", x = seq(20, 80, 10), y = 4,
+               label = c("20", "30", "40", "50", "40", "30", "20"),
+               color = "white", size = 3.8, fontface = "bold") +
+      annotate("text", x = seq(20, 80, 10), y = 56,
+               label = c("20", "30", "40", "50", "40", "30", "20"),
+               color = "white", size = 3.8, fontface = "bold") +
+      annotate("text", x = 5,  y = 30, label = "END\nZONE",
+               color = "white", size = 3.2, fontface = "bold", angle = 90) +
+      annotate("text", x = 95, y = 30, label = "END\nZONE",
+               color = "white", size = 3.2, fontface = "bold", angle = 90)
+
+    if (!isTRUE(input$field_cumulative)) {
+      past <- all %>% filter(week < anim_week())
+      if (nrow(past) > 0) {
+        past <- place(past)
+        p <- p + geom_point(data = past, aes(x = field_x, y = field_y),
+                            color = "white", size = 1.5, alpha = 0.1)
+      }
+    }
+
+    if (nrow(df) > 0) {
+      p <- p +
+        geom_point(data = df, aes(x = field_x, y = field_y, color = position_group),
+                   size = 3.5, alpha = 0.85) +
+        geom_point(data = df, aes(x = field_x, y = field_y),
+                   shape = 21, size = 3.5, color = "white", fill = NA, stroke = 0.6, alpha = 0.6)
+      if (isTRUE(input$field_density) && nrow(df) >= 10)
+        p <- p + geom_density_2d(data = df, aes(x = field_x, y = field_y),
+                                 color = "#ff4444", linewidth = 0.9, alpha = 0.75)
+    } else {
+      p <- p + annotate("text", x = 50, y = 30,
+                        label = "No injuries recorded this week",
+                        color = "#b8c7ce", size = 6, fontface = "italic")
+    }
+
+    p +
+      scale_color_brewer(palette = "Set1") +
+      coord_fixed(ratio = 0.6, xlim = c(0, 100), ylim = c(0, 60)) +
+      labs(color = "Position Group", x = NULL, y = NULL) +
+      theme_void() +
+      theme(
+        plot.background   = element_rect(fill = "#16213e", color = NA),
+        panel.background  = element_rect(fill = "#16213e", color = NA),
+        legend.text       = element_text(color = "white", size = 11),
+        legend.title      = element_text(color = "white", face = "bold", size = 12),
+        legend.background = element_rect(fill = "#16213e", color = NA),
+        legend.position   = "right"
+      )
+  })
+
+  # ── INJURY LOG TABLE ─────────────────────────────────────────────────────────
+  output$injury_log <- DT::renderDataTable({
+    df <- current_week_data()
+    if (nrow(df) == 0) return(data.frame(Message = "No injuries this week"))
+    df %>%
+      select(season, week, full_name, team, position_group,
+             surface_type, avg_ydline_100, total_plays) %>%
+      arrange(desc(season), week)
+  },
+  options = list(
+    pageLength   = 10,
+    scrollX      = TRUE,
+    dom          = "frtip",
+    initComplete = JS("function(settings, json) {
+      $(this.api().table().header()).css({
+        'background-color': '#16213e',
+        'color': 'white'
+      });
+    }")
+  ),
+  style = "bootstrap", class = "table-dark")
+
+  # ── ENVIRONMENT TAB ──────────────────────────────────────────────────────────
+  output$surface_comparison <- renderPlot({
+    req(input$surface_choice)
+    base_data() %>%
+      filter(surface_type %in% input$surface_choice) %>%
+      group_by(surface_type) %>%
+      summarise(rate = mean(injured_next_week, na.rm = TRUE)) %>%
+      ggplot(aes(x = surface_type, y = rate, fill = surface_type)) +
+      geom_col(width = 0.6) +
+      scale_fill_manual(values = c("#c9243f", "#1e5128", "#3db2ff")) +
+      theme_nfl_custom() +
+      labs(x = NULL, y = "Injury Rate")
+  })
+
+  output$temp_plot <- renderPlot({
+    req(input$temp_slider)
+    base_data() %>%
+      filter(temperature >= input$temp_slider[1], temperature <= input$temp_slider[2]) %>%
+      group_by(temp_bucket) %>%
+      summarise(rate = mean(injured_next_week, na.rm = TRUE)) %>%
+      ggplot(aes(x = temp_bucket, y = rate, group = 1)) +
+      geom_area(fill = "#c9243f", alpha = 0.3) +
+      geom_line(color = "#c9243f", size = 1.5) +
+      geom_point(color = "white", size = 3, stroke = 1) +
+      theme_nfl_custom() +
+      labs(x = "Climate Group", y = "Injury Risk")
+  })
+
+  # ── WORKLOAD TAB ─────────────────────────────────────────────────────────────
+  output$workload_plot <- renderPlot({
+    base_data() %>%
+      filter(total_plays >= input$play_limit[1], total_plays <= input$play_limit[2]) %>%
+      ggplot(aes(x = total_plays, y = injured_next_week)) +
+      geom_smooth(method = "glm", method.args = list(family = "binomial"),
+                  color = "#4ecca3", fill = "#4ecca3", alpha = 0.2) +
+      theme_nfl_custom() +
+      labs(y = "Probability of Injury", x = "Total Snaps in Game")
+  })
+
+  # ── TEAM TAB ─────────────────────────────────────────────────────────────────
+  output$team_table <- renderTable({
+    req(input$team_select)
+    df <- base_data() %>% filter(team == input$team_select)
+    if (input$position_filter != "All") df <- df %>% filter(position_group == input$position_filter)
+    df %>%
+      group_by(full_name, position) %>%
+      summarise(
+        weeks_played  = n(),
+        times_injured = sum(injured_next_week, na.rm = TRUE),
+        injury_rate   = paste0(round(mean(injured_next_week, na.rm = TRUE) * 100, 1), "%"),
+        .groups = "drop"
+      ) %>%
+      filter(weeks_played >= 5) %>%
+      arrange(desc(times_injured)) %>%
+      head(15)
+  })
+
+  # ── MODEL LOADING ─────────────────────────────────────────────────────────────
+  xgb_model <- tryCatch({
+    mdl <- readRDS("rds files 2/copyxgb_model.rds")
+    if (is.null(mdl) || length(mdl) == 0) { message("XGBoost empty."); NULL } else mdl
+  }, warning = function(w) { message("XGB warning: ", w$message); NULL },
+     error   = function(e) { message("XGB fail: ",    e$message); NULL })
+
+  rf_model <- tryCatch(
+    readRDS("rds files 2/copyrf_model.rds"),
+    error = function(e) { message("RF fail: ", e$message); NULL }
+  )
+
+  final_lasso <- tryCatch(
+    readRDS("rds files 2/copylasso_model.rds"),
+    error = function(e) { message("Lasso fail: ", e$message); NULL }
+  )
+
+  # ── PREDICTOR SETUP ───────────────────────────────────────────────────────────
+  position_levels <- c("D-Line", "LB", "O-Line", "Other", "QB", "RB",
+                        "Receiver", "Secondary", "Special Teams")
+  surface_levels  <- c("Artificial Turf", "Natural Grass", "Unknown")
+  temp_levels     <- c("Cold", "Cool", "Dome/Unknown", "Freezing", "Hot", "Moderate")
+
+  body_part_profiles <- list(
+    "QB"            = c(Shoulder = 20, Knee = 18, Ankle = 12, Head = 15, Hand = 15, Back = 10, Hamstring = 5,  Foot = 5),
+    "RB"            = c(Shoulder = 8,  Knee = 25, Ankle = 15, Head = 10, Hand = 3,  Back = 5,  Hamstring = 20, Foot = 14),
+    "Receiver"      = c(Shoulder = 10, Knee = 20, Ankle = 15, Head = 12, Hand = 10, Back = 5,  Hamstring = 20, Foot = 8),
+    "O-Line"        = c(Shoulder = 12, Knee = 28, Ankle = 15, Head = 10, Hand = 8,  Back = 12, Hamstring = 8,  Foot = 7),
+    "D-Line"        = c(Shoulder = 14, Knee = 25, Ankle = 14, Head = 12, Hand = 6,  Back = 10, Hamstring = 10, Foot = 9),
+    "LB"            = c(Shoulder = 15, Knee = 22, Ankle = 12, Head = 14, Hand = 5,  Back = 8,  Hamstring = 15, Foot = 9),
+    "Secondary"     = c(Shoulder = 12, Knee = 20, Ankle = 13, Head = 15, Hand = 5,  Back = 5,  Hamstring = 22, Foot = 8),
+    "Special Teams" = c(Shoulder = 10, Knee = 22, Ankle = 15, Head = 12, Hand = 5,  Back = 8,  Hamstring = 18, Foot = 10)
+  )
+
+  play_risk_profiles <- list(
+    "QB"            = c("Sack / Pressure" = 30, "Scramble / Run" = 20, "Dropback Pass" = 18, "Play Action" = 12, "QB Sneak" = 10, "Screen Pass" = 5, "Other" = 5),
+    "RB"            = c("Inside Run" = 28, "Outside Run" = 22, "Pass Blocking" = 15, "Receiving Route" = 12, "Kick Return" = 10, "Goal Line Carry" = 8, "Other" = 5),
+    "Receiver"      = c("Route Running" = 25, "Contested Catch" = 20, "After Catch (YAC)" = 18, "Blocking Downfield" = 12, "Deep Route" = 10, "Screen / Bubble" = 8, "Other" = 7),
+    "O-Line"        = c("Pass Blocking" = 35, "Run Blocking" = 28, "Pulling / Trap" = 15, "Double Team" = 10, "Screen Block" = 7, "Other" = 5),
+    "D-Line"        = c("Pass Rush" = 32, "Run Stuff" = 25, "Tackle Attempt" = 18, "Stunts / Twists" = 12, "Pile Play" = 8, "Other" = 5),
+    "LB"            = c("Tackle Attempt" = 28, "Blitz / Rush" = 20, "Zone Coverage" = 15, "Pursuit / Chase" = 14, "Man Coverage" = 10, "Run Fill" = 8, "Other" = 5),
+    "Secondary"     = c("Man Coverage" = 25, "Tackle Attempt" = 22, "Zone Coverage" = 15, "Ball Breakup" = 13, "Blitz" = 10, "Kick Coverage" = 8, "Other" = 7),
+    "Special Teams" = c("Kick Coverage" = 28, "Kick Return" = 25, "Punt Block / Rush" = 15, "Gunner / Jammer" = 12, "Field Goal Block" = 10, "Other" = 10)
+  )
+
+  injury_mechanisms <- list(
+    "QB"            = list(top_risk = "Shoulder & Knee",  mechanism = "Non-contact arm injuries during throws, lower body from sacks.",   surface_note = "Artificial turf increases ankle sprain risk by ~16% for QBs.", age_note = "Injury risk rises after age 30."),
+    "RB"            = list(top_risk = "Knee & Hamstring", mechanism = "Repetitive high-impact contact leads to cumulative knee stress.",   surface_note = "Turf increases non-contact lower extremity injuries.",           age_note = "Spike after age 27."),
+    "Receiver"      = list(top_risk = "Hamstring & Knee", mechanism = "Explosive cuts strain hamstrings and knees.",                       surface_note = "Turf is particularly dangerous for receivers.",                  age_note = "Soft tissue injuries increase after age 28."),
+    "O-Line"        = list(top_risk = "Knee & Ankle",     mechanism = "Sustained blocking puts lateral stress on knees.",                  surface_note = "Surface has less impact on O-Line.",                            age_note = "Higher knee degeneration after 8+ years."),
+    "D-Line"        = list(top_risk = "Knee & Shoulder",  mechanism = "Explosive pass rush puts high torque on knees.",                   surface_note = "Turf increases lower extremity risk.",                          age_note = "Increases after age 29."),
+    "LB"            = list(top_risk = "Knee & Shoulder",  mechanism = "Tackling is the primary injury mechanism.",                        surface_note = "Elevated concussion risk on turf.",                             age_note = "Tackle volume more predictive than age."),
+    "Secondary"     = list(top_risk = "Hamstring & Knee", mechanism = "Backpedaling and transitions strain hamstrings.",                   surface_note = "High turf-related injury differentials.",                       age_note = "Hamstring risk increases sharply after 28."),
+    "Special Teams" = list(top_risk = "Knee & Hamstring", mechanism = "Full-speed collisions on kickoffs.",                                surface_note = "Similar rates on both surfaces.",                               age_note = "Tied more to snap count than age.")
+  )
+
+  lasso_intercept <- -1.86752973
+  lasso_coefs <- c(
+    years_exp      =  0.08449421,
+    surface_type   =  0.01558592,
+    temp_bucket    =  0.00927171,
+    total_plays    = -0.00251280,
+    avg_air_yards  =  0.00571426,
+    bmi            =  0.00334269,
+    rush_plays     =  0.01388763,
+    age            = -0.07195676,
+    position_group =  0.00383627,
+    is_home        = -0.01446860,
+    avg_ydline_100 =  0.00084164
+  )
+
+  # ── PREDICTOR EVENT ───────────────────────────────────────────────────────────
+  observeEvent(input$predict_btn, {
+
+    input_vals <- c(
+      years_exp      = as.numeric(input$pred_exp),
+      surface_type   = as.numeric(factor(input$pred_surface, levels = surface_levels)),
+      temp_bucket    = as.numeric(factor("Dome/Unknown",      levels = temp_levels)),
+      total_plays    = as.numeric(input$pred_plays),
+      avg_air_yards  = 0,
+      bmi            = as.numeric(input$pred_bmi),
+      rush_plays     = 0,
+      age            = as.numeric(input$pred_age),
+      position_group = as.numeric(factor(input$pred_position, levels = position_levels)),
+      is_home        = 1,
+      avg_ydline_100 = 50
+    )
+
+    pred_input           <- matrix(input_vals, nrow = 1)
+    colnames(pred_input) <- names(input_vals)
+    prob                 <- NA
+
+    if (input$pred_model == "XGBoost" && !is.null(xgb_model)) {
+      prob <- tryCatch({
+        dmat <- xgboost::xgb.DMatrix(data = pred_input)
+        as.numeric(predict(xgb_model, dmat)[1])
+      }, error = function(e) NA)
+
+    } else if (input$pred_model == "Random Forest" && !is.null(rf_model)) {
+      prob <- tryCatch({
+        pred_df <- as.data.frame(pred_input)
+        for (col in names(pred_df)) pred_df[[col]] <- as.numeric(pred_df[[col]])
+        as.numeric(predict(rf_model, newdata = pred_df, type = "prob")[1, "1"])
+      }, error = function(e) NA)
+
+    } else if (input$pred_model == "Lasso" && !is.null(final_lasso)) {
+      prob <- tryCatch({
+        raw <- predict(final_lasso, newx = pred_input,
+                       s = final_lasso$lambda[1], type = "response")
+        as.numeric(raw[1])
+      }, error = function(e) NA)
+    }
+
+    if (is.na(prob)) {
+      linear_pred <- lasso_intercept + sum(lasso_coefs * input_vals)
+      prob        <- 1 / (1 + exp(-linear_pred))
+    }
+
+    prob <- max(0, min(1, as.numeric(prob[1])))
+    pct  <- round(prob * 100, 1)
+
+    output$pred_probability <- renderText({
+      if (is.na(pct)) "N/A" else paste0(pct, "%")
+    })
+
+    output$pred_label <- renderText({
+      if (is.na(prob))        "Error"
+      else if (prob >= 0.045) "High Injury Risk"
+      else if (prob >= 0.03)  "Moderate Injury Risk"
+      else                    "Low Injury Risk"
+    })
+
+    output$body_part_pie <- renderPlot({
+      pos     <- input$pred_position
+      profile <- body_part_profiles[[pos]]
+      if (is.null(profile)) profile <- body_part_profiles[["QB"]]
+      pie_data <- data.frame(body_part = names(profile), percentage = as.numeric(profile)) %>%
+        arrange(desc(percentage)) %>%
+        mutate(
+          body_part = factor(body_part, levels = body_part),
+          label     = paste0(body_part, "\n", percentage, "%")
+        )
+      pie_colors <- c("#c9243f", "#e8575a", "#f09090", "#3db2ff",
+                      "#4ecca3", "#f0c040", "#b07cd8", "#6c8ebf")
+      ggplot(pie_data, aes(x = "", y = percentage, fill = body_part)) +
+        geom_col(width = 1, color = "#16213e", linewidth = 0.8) +
+        coord_polar(theta = "y") +
+        scale_fill_manual(values = pie_colors) +
+        geom_text(aes(label = label), position = position_stack(vjust = 0.5),
+                  color = "white", size = 3.5, fontface = "bold") +
+        labs(title = paste0("Injury Distribution - ", pos), fill = "Body Region") +
+        theme_void() +
+        theme(
+          plot.background  = element_rect(fill = "#16213e", color = NA),
+          panel.background = element_rect(fill = "#16213e", color = NA),
+          plot.title       = element_text(color = "white", hjust = 0.5, size = 16, face = "bold"),
+          legend.text      = element_text(color = "#e0e0e0"),
+          legend.title     = element_text(color = "white", face = "bold")
+        )
+    })
+
+    output$risk_plays_plot <- renderPlot({
+      pos   <- input$pred_position
+      plays <- play_risk_profiles[[pos]]
+      if (is.null(plays)) plays <- play_risk_profiles[["QB"]]
+      play_data <- data.frame(play_type = names(plays), percentage = as.numeric(plays)) %>%
+        mutate(play_type = factor(play_type, levels = rev(play_type)))
+      ggplot(play_data, aes(x = play_type, y = percentage, fill = percentage)) +
+        geom_col(width = 0.7, show.legend = FALSE) +
+        geom_text(aes(label = paste0(percentage, "%")), hjust = -0.2,
+                  color = "white", size = 4, fontface = "bold") +
+        coord_flip() +
+        scale_fill_gradient(low = "#3db2ff", high = "#c9243f") +
+        scale_y_continuous(expand = expansion(mult = c(0, 0.15))) +
+        labs(title = paste0("Injury Risk by Play Type - ", pos), x = NULL, y = "% of Injuries") +
+        theme_minimal() +
+        theme(
+          text               = element_text(color = "white"),
+          plot.background    = element_rect(fill = "#16213e", color = NA),
+          panel.background   = element_rect(fill = "#16213e", color = NA),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor   = element_blank(),
+          panel.grid.major.x = element_line(color = "#2a3a5a"),
+          axis.text          = element_text(color = "#e0e0e0", size = 11),
+          plot.title         = element_text(face = "bold", size = 14, color = "white")
+        )
+    })
+
+    output$risk_factor_plot <- renderPlot({
+      baseline <- c(years_exp = 4, surface_type = 2, temp_bucket = 3, total_plays = 30,
+                    avg_air_yards = 0, bmi = 27, rush_plays = 0, age = 26,
+                    position_group = 5, is_home = 1, avg_ydline_100 = 50)
+      nice_names <- c(
+        years_exp = "Experience", surface_type = "Surface", temp_bucket = "Temperature",
+        total_plays = "Total Plays", avg_air_yards = "Air Yards", bmi = "BMI",
+        rush_plays = "Rush Plays", age = "Age", position_group = "Position",
+        is_home = "Home/Away", avg_ydline_100 = "Avg Yard Line"
+      )
+      contributions <- lasso_coefs * (input_vals - baseline)
+      contrib_data  <- data.frame(
+        factor_name  = nice_names[names(contributions)],
+        contribution = as.numeric(contributions)
+      ) %>%
+        filter(abs(contribution) > 0.001) %>%
+        arrange(contribution) %>%
+        mutate(
+          factor_name = factor(factor_name, levels = factor_name),
+          direction   = ifelse(contribution > 0, "Increases Risk", "Decreases Risk")
+        )
+      ggplot(contrib_data, aes(x = factor_name, y = contribution, fill = direction)) +
+        geom_col(width = 0.6, show.legend = TRUE) +
+        coord_flip() +
+        scale_fill_manual(values = c("Increases Risk" = "#c9243f", "Decreases Risk" = "#4ecca3")) +
+        geom_hline(yintercept = 0, color = "#b8c7ce", linetype = "dashed") +
+        labs(title = "Risk Factor Contributions", x = NULL,
+             y = "Effect on Injury Probability", fill = NULL) +
+        theme_minimal() +
+        theme(
+          text               = element_text(color = "white"),
+          plot.background    = element_rect(fill = "#16213e", color = NA),
+          panel.background   = element_rect(fill = "#16213e", color = NA),
+          panel.grid.major.y = element_blank(),
+          panel.grid.minor   = element_blank(),
+          panel.grid.major.x = element_line(color = "#2a3a5a"),
+          axis.text          = element_text(color = "#e0e0e0", size = 10),
+          plot.title         = element_text(face = "bold", size = 13, color = "white"),
+          legend.position    = "bottom",
+          legend.text        = element_text(color = "#e0e0e0")
+        )
+    })
+
+    output$risk_profile_text <- renderUI({
+      pos  <- input$pred_position
+      info <- injury_mechanisms[[pos]]
+      if (is.null(info)) info <- injury_mechanisms[["QB"]]
+
+      workload_flag <- if (input$pred_plays >= 50)
+        tags$p(icon("exclamation-triangle"), tags$b(" HIGH WORKLOAD WARNING: "),
+               paste0(input$pred_plays, " plays significantly elevates injury risk."),
+               style = "color:#f0c040; background-color:#2a2a1a; padding:10px; border-radius:6px; margin-bottom:12px;")
+      else NULL
+
+      age_flag <- if (input$pred_age >= 30)
+        tags$p(icon("clock"), tags$b(" AGE FACTOR: "), "Player is 30+. Recovery time elevated.",
+               style = "color:#e8575a; background-color:#2a1a1a; padding:10px; border-radius:6px; margin-bottom:12px;")
+      else NULL
+
+      surface_flag <- if (input$pred_surface == "Artificial Turf")
+        tags$p(icon("exclamation-circle"), tags$b(" SURFACE RISK: "), info$surface_note,
+               style = "color:#3db2ff; background-color:#1a1a2e; padding:10px; border-radius:6px; margin-bottom:12px;")
+      else NULL
+
+      tagList(
+        tags$div(style = "padding:10px;",
+          tags$h4(paste0(pos, " - ", info$top_risk, " Most At Risk"),
+                  style = "color:#c9243f; font-weight:bold; margin-bottom:15px; font-size:18px;"),
+          tags$p(icon("notes-medical"), tags$b(" Primary Injury Mechanism"),
+                 style = "color:white; font-size:14px; margin-bottom:5px;"),
+          tags$p(info$mechanism,
+                 style = "color:#b8c7ce; font-size:13px; margin-bottom:15px; line-height:1.5;"),
+          workload_flag,
+          age_flag,
+          surface_flag,
+          tags$p(icon("user-clock"), tags$b(" Age Insight: "), info$age_note,
+                 style = "color:#b8c7ce; font-size:12px; margin-top:10px;"),
+          tags$hr(style = "border-color:#2a3a5a;"),
+          tags$p(icon("lightbulb"), tags$b(" Quick Stats: "),
+                 paste0("Predicted risk: ", pct, "% | Model: ", input$pred_model,
+                        " | Plays: ", input$pred_plays, " | Age: ", input$pred_age,
+                        " | Surface: ", input$pred_surface),
+                 style = "color:#6c8ebf; font-size:11px;")
+        )
+      )
+    })
+  }) # end observeEvent predict_btn
+
+  # ── POSITION TAB ─────────────────────────────────────────────────────────────
+  output$position_rate_plot <- renderPlot({
+    req(input$position_choice)
+    base_data() %>%
+      filter(position_group %in% input$position_choice) %>%
+      group_by(position_group) %>%
+      summarise(injury_rate = mean(injured_next_week, na.rm = TRUE)) %>%
+      ggplot(aes(x = reorder(position_group, injury_rate), y = injury_rate, fill = position_group)) +
+      geom_col(show.legend = FALSE) +
+      coord_flip() +
+      scale_fill_brewer(palette = "Set1") +
+      labs(x = "Position Group", y = "Injury Rate") +
+      theme_minimal() +
+      theme(
+        text             = element_text(color = "white"),
+        panel.background = element_rect(fill = "#16213e", color = NA),
+        plot.background  = element_rect(fill = "#16213e", color = NA)
+      )
+  })
+
+  # ── OVERVIEW TAB ─────────────────────────────────────────────────────────────
+  output$total_injuries_box <- renderInfoBox({
+    val <- sum(base_data()$injured_next_week, na.rm = TRUE)
+    infoBox("Total Injuries", val, icon = icon("user-injured"), color = "red")
+  })
+
+  output$avg_per_season_box <- renderInfoBox({
+    val <- base_data() %>%
+      group_by(season) %>%
+      summarise(inj = sum(injured_next_week)) %>%
+      summarise(mean(inj)) %>%
+      pull()
+    infoBox("Avg Injuries / Season", round(val, 1), icon = icon("calendar"), color = "yellow")
+  })
+
+  output$injury_rate_box <- renderInfoBox({
+    val <- mean(base_data()$injured_next_week, na.rm = TRUE)
+    infoBox("Injury Rate", paste0(round(val * 100, 1), "%"), icon = icon("percent"), color = "aqua")
+  })
+
+  output$injury_cost_box <- renderInfoBox({
+    infoBox("Estimated Injury Cost", "$500 - 800M+ / year",
+            subtitle = "League-wide estimate", icon = icon("dollar-sign"), color = "green")
+  })
+
+  output$injury_season_trend <- renderPlot({
+    base_data() %>%
+      group_by(week) %>%
+      summarise(injuries = sum(injured_next_week)) %>%
+      ggplot(aes(week, injuries)) +
+      geom_line(color = "#c9243f", size = 1.2) +
+      theme_minimal()
+  })
+
+  output$overview_position_plot <- renderPlot({
+    base_data() %>%
+      group_by(position_group) %>%
+      summarise(rate = mean(injured_next_week)) %>%
+      ggplot(aes(reorder(position_group, rate), rate, fill = position_group)) +
+      geom_col(show.legend = FALSE) +
+      coord_flip() +
+      theme_minimal()
+  })
+
+  output$overview_workload_plot <- renderPlot({
+    base_data() %>%
+      ggplot(aes(total_plays, injured_next_week)) +
+      geom_smooth(method = "glm", method.args = list(family = "binomial"), color = "#c9243f") +
+      theme_minimal()
+  })
+
+  # ── RULES TAB ────────────────────────────────────────────────────────────────
+  output$rules_hits_plot <- renderPlot({
+    req(base_data())
+    base_data() %>%
+      filter(!is.na(times_hit), !is.na(injured_next_week)) %>%
+      ggplot(aes(times_hit, injured_next_week)) +
+      geom_smooth(method = "glm", method.args = list(family = "binomial"), color = "#c9243f") +
+      theme_minimal()
+  })
+
+  output$rules_workload_plot <- renderPlot({
+    req(base_data())
+    base_data() %>%
+      filter(!is.na(total_plays), !is.na(injured_next_week)) %>%
+      ggplot(aes(total_plays, injured_next_week)) +
+      geom_smooth(method = "glm", method.args = list(family = "binomial"), color = "#c9243f") +
+      theme_minimal()
+  })
+
+  output$rules_concussion_plot <- renderPlot({
+    req(base_data())
+    base_data() %>%
+      filter(!is.na(injured_next_week)) %>%
+      summarise(rate = mean(injured_next_week)) %>%
+      ggplot(aes(x = "All Players", y = rate)) +
+      geom_col(fill = "#c9243f") +
+      ylim(0, 1) +
+      theme_minimal()
+  })
+
+} # end server
+
+
+# ─── RUN APP ───────────────────────────────────────────────────────────────────
+shinyApp(ui, server)
+```
+
+
+
